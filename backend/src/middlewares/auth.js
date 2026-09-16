@@ -1,30 +1,46 @@
-import { supabaseAdmin } from "../supabase.js";
+import jwt from "jsonwebtoken";
+import { query } from "../db.js";
 import { verifyImpToken } from "../lib/impToken.js";
 
 // ===============
 // Helper: cargar profile + roles
 // ===============
 async function loadProfileAndRoles(user) {
-  const { data: profile, error: pErr } = await supabaseAdmin
-    .from("users")
-    .select(
-      "id,name,email,cedula,code_jiliu,id_course,course:course!users_id_course_fkey(id,name,level,year),created_at"
-    )
-    .eq("id", user.id)
-    .maybeSingle();
+  const { rows: profileRows } = await query(
+    `SELECT u.id, u.name, u.email, u.cedula, u.code_jiliu, u.id_course, u.created_at, u.estado,
+            c.id AS course_id, c.name AS course_name, c.level AS course_level, c.year AS course_year
+     FROM users u
+     LEFT JOIN course c ON c.id = u.id_course
+     WHERE u.id = $1
+     LIMIT 1`,
+    [user.id]
+  );
+  const row = profileRows[0];
 
-  if (pErr) throw new Error(pErr.message);
+  const course = row?.course_id
+    ? { id: row.course_id, name: row.course_name, level: row.course_level, year: row.course_year }
+    : null;
 
-  const { data: rolesRows, error: rErr } = await supabaseAdmin
-    .from("user_type")
-    .select("type:type(code)")
-    .eq("id_user", user.id);
+  const profile = row
+    ? {
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        cedula: row.cedula,
+        code_jiliu: row.code_jiliu,
+        id_course: row.id_course,
+        created_at: row.created_at,
+        estado: row.estado,
+        course,
+      }
+    : null;
 
-  if (rErr) throw new Error(rErr.message);
+  const { rows: rolesRows } = await query(
+    `SELECT t.code FROM user_type ut JOIN type t ON t.id = ut.id_type WHERE ut.id_user = $1`,
+    [user.id]
+  );
 
-  const roles = (rolesRows || [])
-    .map((x) => x?.type?.code)
-    .filter(Boolean);
+  const roles = rolesRows.map((r) => r.code).filter(Boolean);
 
   const role = roles.includes("A")
     ? "A"
@@ -70,15 +86,22 @@ async function validateTokenAndLoadContext(token) {
     }
   }
 
-  // Token normal de Supabase
-  const { data, error } = await supabaseAdmin.auth.getUser(token);
-
-  if (error || !data?.user) {
+  // Token normal: JWT propio (emitido por POST /auth/login)
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.JWT_SECRET);
+  } catch {
     return { ok: false, error: "Token inválido o expirado" };
   }
 
-  const user = data.user;
+  const user = { id: decoded.sub, email: decoded.email };
   const { profile, course, roles, role } = await loadProfileAndRoles(user);
+
+  // Bloquea sesiones de personas retiradas, incluso si su JWT todavía no expiró
+  // (no hay revocación de tokens, así que este chequeo corre en cada request).
+  if (profile && profile.estado !== "Activo") {
+    return { ok: false, error: "Tu cuenta ha sido retirada. Contacta al administrador." };
+  }
 
   return {
     ok: true,
@@ -117,7 +140,7 @@ export async function requireUser(req, res, next) {
 
     const result = await validateTokenAndLoadContext(token);
     if (!result.ok) {
-      return res.status(401).json({ error: "Token inválido o expirado" });
+      return res.status(401).json({ error: result.error || "Token inválido o expirado" });
     }
 
     req.auth = result.auth;
@@ -142,7 +165,7 @@ export async function requireAuth(req, res, next) {
 
     const result = await validateTokenAndLoadContext(token);
     if (!result.ok) {
-      return res.status(401).json({ error: "Token inválido o expirado" });
+      return res.status(401).json({ error: result.error || "Token inválido o expirado" });
     }
 
     if (!result.auth?.profile) {
