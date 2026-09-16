@@ -220,7 +220,7 @@ export default function LoginPage() {
                 letterSpacing: "-0.02em",
               }}
             >
-              Iniciar sesión en SOFIA
+              Iniciar sesión
             </h1>
 
             {error && (
