@@ -24,7 +24,7 @@ app.use(cors({
 
 app.use(express.json({ limit: '2mb' }));
 
-app.get('/health', (_, res) => res.json({ ok: true }));
+app.get('/health', (_, res) => res.json({ ok: true, service: "sofia-backend" }));
 
 // auth: lee JWT del frontend (supabase) y adjunta user/role
 app.use(authMiddleware);
