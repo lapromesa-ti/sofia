@@ -21,7 +21,7 @@ export function createApp() {
     allowedHeaders: ["Content-Type", "Authorization"],
   }));
   app.use(express.json({ limit: "2mb" }));
-  app.get("/health", (_, res) => res.json({ ok: true }));
+  app.get("/health", (_, res) => res.json({ ok: true, service: "sofia-backend", pipelineTest: "20260916" }));
   app.use(authMiddleware);
   app.use("/api/auth",    authRouter);
   app.use("/api/admin",   adminRouter);

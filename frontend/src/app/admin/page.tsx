@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
-import { supabase } from "@/lib/supabaseClient";
+import { getSession, getToken, signOut } from "@/lib/auth";
 import { apiFetch } from "@/lib/api";
 import { primaryRole, roleLabelFromRole } from "@/lib/roles";
 import { getActiveRole, roleToRoute } from "@/lib/activeRole";
@@ -115,6 +115,11 @@ const ROLE_OPTIONS = [
   { value: "T", label: "Profesor" },
   { value: "A", label: "Admin" },
   { value: "E", label: "Secretaría" },
+] as const;
+
+const ESTADO_OPTIONS = [
+  { value: "Activo", label: "Activo" },
+  { value: "Retirado", label: "Retirado" },
 ] as const;
 
 const _TEMPLATE_PUBLIC_URL =
@@ -290,6 +295,7 @@ export default function AdminPage() {
   const [uRoles, setURoles] = useState<Record<"S" | "T" | "A" | "M" | "E", boolean>>({
     S: false, T: false, A: false, M: false, E: false,
   });
+  const [uEstado, setUEstado] = useState<"Activo" | "Retirado">("Activo");
   const [, setUSearching] = useState(false);
   const [uFoundUser, setUFoundUser] = useState(false);
   const [_uNotFound, setUNotFound] = useState(false);
@@ -297,7 +303,7 @@ export default function AdminPage() {
   const [confirmDeleteUser, setConfirmDeleteUser] = useState(false);
 
   const [userSearchQ, setUserSearchQ] = useState("");
-  const [userSearchResults, setUserSearchResults] = useState<Array<{ id: string; cedula: string; name: string; email: string; roles: string[]; course_name: string | null }>>([]);
+  const [userSearchResults, setUserSearchResults] = useState<Array<{ id: string; cedula: string; name: string; email: string; roles: string[]; course_name: string | null; estado?: string }>>([]);
   const [userSearchLoading, setUserSearchLoading] = useState(false);
   const [userSearchOpen, setUserSearchOpen] = useState(false);
 
@@ -427,8 +433,7 @@ export default function AdminPage() {
   }
 
   useEffect(() => {
-    const { data } = supabase.storage.from("assets").getPublicUrl("brand/logo.png");
-    setLogoUrl(data.publicUrl);
+    setLogoUrl("/logo.png");
   }, []);
 
   useEffect(() => {
@@ -446,8 +451,7 @@ export default function AdminPage() {
     (async () => {
       setLoadingMe(true);
       try {
-        const { data } = await supabase.auth.getSession();
-        if (!data.session) return router.replace("/login");
+        if (!getSession()) return router.replace("/login");
 
         const info = await apiFetch("/api/auth/me");
         setMe(info);
@@ -1572,6 +1576,7 @@ export default function AdminPage() {
     setUCourseId("");
     setULevelId("");
     setURoles({ S: false, T: false, A: false, M: false, E: false });
+    setUEstado("Activo");
     setUFoundUser(false);
     setUNotFound(false);
     setUSearching(false);
@@ -1618,6 +1623,7 @@ export default function AdminPage() {
       const roleMap: Record<string, boolean> = { S: false, T: false, A: false, M: false, E: false };
       (u.roles || []).forEach((r: string) => { if (r in roleMap) roleMap[r] = true; });
       setURoles(roleMap as Record<"S" | "T" | "A" | "M" | "E", boolean>);
+      setUEstado(u.estado === "Retirado" ? "Retirado" : "Activo");
       setUFoundUser(true);
     } catch (e) {
       if ((e as { message?: string })?.message?.includes("404") || (e as { message?: string })?.message?.includes("No encontrado")) {
@@ -1625,6 +1631,7 @@ export default function AdminPage() {
         setUNotFound(true);
         setUName(""); setUEmail(""); setUCodeJiliu(""); setUCourseId(""); setULevelId("");
         setURoles({ S: false, T: false, A: false, M: false, E: false });
+        setUEstado("Activo");
         showErr("Persona no encontrada");
       } else {
         showErr((e as { message?: string })?.message || "Error buscando persona");
@@ -1650,7 +1657,7 @@ export default function AdminPage() {
     if (needsStudentFields && !uCodeJiliu.trim())     return showErr("Código Jiliu requerido para Estudiante/Monitor.");
     if (needsStudentFields && !uCourseId)             return showErr("Curso requerido para Estudiante/Monitor.");
 
-    const payload: Record<string, unknown> = { email, name, cedula, roles };
+    const payload: Record<string, unknown> = { email, name, cedula, roles, estado: uEstado };
     if (needsStudentFields) {
       payload.code_jiliu = uCodeJiliu.trim();
       payload.id_course  = Number(uCourseId);
@@ -1678,8 +1685,7 @@ export default function AdminPage() {
   async function downloadTemplate() {
     setTemplateLoading(true);
     try {
-      const { data: sess } = await supabase.auth.getSession();
-      const token = sess.session?.access_token;
+      const token = getToken();
       const resp = await fetch(
         `${process.env.NEXT_PUBLIC_API_BASE_URL || ""}/api/admin/download-template`,
         { headers: token ? { Authorization: `Bearer ${token}` } : {} }
@@ -1712,8 +1718,7 @@ export default function AdminPage() {
       const fd = new FormData();
       fd.append("file", file);
 
-      const { data: sess } = await supabase.auth.getSession();
-      const token = sess.session?.access_token;
+      const token = getToken();
 
       const resp = await fetch(
         `${process.env.NEXT_PUBLIC_API_BASE_URL || ""}/api/admin/upload-users`,
@@ -2095,7 +2100,7 @@ export default function AdminPage() {
   }
 
   async function handleLogout() {
-    await supabase.auth.signOut();
+    signOut();
     router.replace("/login");
   }
 
@@ -3659,6 +3664,7 @@ export default function AdminPage() {
                             <th style={{ padding: "8px 12px", textAlign: "left", fontWeight: 600, borderBottom: "1px solid var(--stroke)" }}>Nombre</th>
                             <th style={{ padding: "8px 12px", textAlign: "left", fontWeight: 600, borderBottom: "1px solid var(--stroke)" }}>Rol</th>
                             <th style={{ padding: "8px 12px", textAlign: "left", fontWeight: 600, borderBottom: "1px solid var(--stroke)" }}>Curso</th>
+                            <th style={{ padding: "8px 12px", textAlign: "left", fontWeight: 600, borderBottom: "1px solid var(--stroke)" }}>Estado</th>
                             <th style={{ padding: "8px 12px", borderBottom: "1px solid var(--stroke)" }}></th>
                           </tr>
                         </thead>
@@ -3669,6 +3675,7 @@ export default function AdminPage() {
                               <td style={{ padding: "8px 12px" }}>{u.name}</td>
                               <td style={{ padding: "8px 12px", color: "var(--muted, #6b7280)" }}>{u.roles.map(r => ROLE_OPTIONS.find(o => o.value === r)?.label ?? r).join(", ") || "—"}</td>
                               <td style={{ padding: "8px 12px", color: "var(--muted, #6b7280)" }}>{u.roles.includes("S") ? (u.course_name || "—") : "—"}</td>
+                              <td style={{ padding: "8px 12px", color: u.estado === "Retirado" ? "#dc2626" : "var(--muted, #6b7280)" }}>{u.estado || "Activo"}</td>
                               <td style={{ padding: "8px 12px", textAlign: "right" }}>
                                 <button
                                   type="button"
@@ -3721,6 +3728,18 @@ export default function AdminPage() {
                           }}
                         />
                         <span>{r.label}</span>
+                      </label>
+                    ))}
+                    <div style={{ width: 1, alignSelf: "stretch", background: "var(--stroke)" }} />
+                    <div style={{ fontSize: 14, fontWeight: 700 }}>Estado</div>
+                    {ESTADO_OPTIONS.map((o) => (
+                      <label key={o.value} style={{ display: "flex", gap: 6, alignItems: "center", cursor: "pointer", fontSize: 14 }}>
+                        <input
+                          type="checkbox"
+                          checked={uEstado === o.value}
+                          onChange={() => setUEstado(o.value)}
+                        />
+                        <span>{o.label}</span>
                       </label>
                     ))}
                   </div>
