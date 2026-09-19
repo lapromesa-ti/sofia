@@ -8,7 +8,9 @@ function getResend() {
   return resend;
 }
 
-const FROM = "WebNotas JILIU <no-responder@sofialapromesa.orko.com.co>";
+// El dominio debe estar verificado en Resend antes de enviar en producción.
+// MAIL_FROM permite cambiar el remitente desde Render sin modificar el código.
+const FROM = process.env.MAIL_FROM || "WebNotas JILIU <no-responder@sofia-lapromesa.com>";
 
 export async function sendPasswordResetEmail(toEmail, resetLink) {
   const client = getResend();
