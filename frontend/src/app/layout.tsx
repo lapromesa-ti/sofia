@@ -8,7 +8,12 @@ export const metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="es">
-      <body>{children}</body>
+      <body>
+        <div className="qa-environment-banner" role="status">
+          AMBIENTE QA
+        </div>
+        {children}
+      </body>
     </html>
   );
 }
