@@ -10,7 +10,7 @@ function getResend() {
 
 // El dominio debe estar verificado en Resend antes de enviar en producción.
 // MAIL_FROM permite cambiar el remitente desde Render sin modificar el código.
-const FROM = process.env.MAIL_FROM || "WebNotas JILIU <no-responder@sofia-lapromesa.com>";
+const FROM = process.env.MAIL_FROM || "Sofia JILIU <no-responder@sofia-lapromesa.com>";
 
 export async function sendPasswordResetEmail(toEmail, resetLink) {
   const client = getResend();
@@ -23,7 +23,7 @@ export async function sendPasswordResetEmail(toEmail, resetLink) {
     html: `
       <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
         <h2>Restablecer tu contraseña</h2>
-        <p>Recibimos una solicitud para restablecer tu contraseña en WebNotas JILIU.</p>
+        <p>Recibimos una solicitud para restablecer tu contraseña en Sofia JILIU.</p>
         <p>
           <a href="${resetLink}" style="display:inline-block;background:#16A34A;color:#fff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:bold;">
             Restablecer contraseña
