@@ -18,7 +18,7 @@ export async function sendPasswordResetEmail(toEmail, resetLink) {
   const { error } = await client.emails.send({
     from: FROM,
     to: toEmail,
-    subject: "Restablecer tu contraseña — WebNotas JILIU",
+    subject: "Restablecer tu contraseña - Sofia JILIU",
     text: `Recibimos una solicitud para restablecer tu contraseña.\n\nHacé clic en este link (válido por 30 minutos):\n${resetLink}\n\nSi no pediste este cambio, ignorá este correo.`,
     html: `
       <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
