@@ -4,7 +4,7 @@ import XLSX from "xlsx";
 import ExcelJS from "exceljs";
 import bcrypt from "bcryptjs";
 import { requireAuth } from "../middlewares/auth.js";
-import { query } from "../db.js";
+import { query, pool } from "../db.js";
 import {
   getAnioLectivoVigente,
   invalidarCacheAnioLectivo,
@@ -512,54 +512,276 @@ adminRouter.get("/classes", requireAuth, requireAdminOrSecretary, async (req, re
   return res.json({ items });
 });
 
+// ----- Helpers de gestión de materias / módulos / grupos -----
+
+// Normaliza un nombre: recorta extremos y colapsa espacios internos.
+function normName(v) {
+  return cleanStr(v).replace(/\s+/g, " ");
+}
+
+// Expresión SQL equivalente a normName() + minúsculas, para comparar sin
+// distinguir mayúsculas ni espacios sobrantes.
+const SQL_NORM_NAME = `lower(regexp_replace(btrim(name), '\\s+', ' ', 'g'))`;
+
+// Ejecuta fn(client) dentro de una transacción (BEGIN/COMMIT/ROLLBACK).
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+function httpError(status, message) {
+  return { status, message };
+}
+
+// Devuelve el id de módulo a usar: existente (validado) o nuevo (reutiliza si
+// ya existe uno con el mismo nombre normalizado en el año).
+async function resolveModuleForClass(db, { id_module, new_module_name }, year) {
+  const newName = normName(new_module_name);
+  if (!id_module && newName) {
+    const { rows } = await db.query(
+      `SELECT id FROM module WHERE year = $1 AND ${SQL_NORM_NAME} = lower($2) LIMIT 1`,
+      [year, newName]
+    );
+    if (rows[0]?.id) return { id: rows[0].id, created: false };
+    const { rows: created } = await db.query(
+      `INSERT INTO module (name, year) VALUES ($1, $2) RETURNING id`,
+      [newName, year]
+    );
+    return { id: created[0].id, created: true };
+  }
+  if (!id_module) throw httpError(400, "Selecciona un módulo o escribe el nombre de uno nuevo.");
+  const { rows } = await db.query(`SELECT id, year FROM module WHERE id = $1 LIMIT 1`, [id_module]);
+  if (!rows[0]?.id) throw httpError(404, "El módulo seleccionado no existe.");
+  if (Number(rows[0].year) !== Number(year)) {
+    throw httpError(403, `El módulo no pertenece al año lectivo vigente (${year}).`);
+  }
+  return { id: rows[0].id, created: false };
+}
+
+// Devuelve el id de grupo a usar (o null = sin grupo). Los grupos pertenecen a
+// un módulo, por lo que la búsqueda/creación se hace dentro de ese módulo.
+async function resolveGroupForClass(db, { id_group, new_group_name }, id_module, year) {
+  const newName = normName(new_group_name);
+  if (!id_group && newName) {
+    const { rows } = await db.query(
+      `SELECT id FROM "group" WHERE year = $1 AND id_module = $2 AND ${SQL_NORM_NAME} = lower($3) LIMIT 1`,
+      [year, id_module, newName]
+    );
+    if (rows[0]?.id) return { id: rows[0].id, created: false };
+    const { rows: created } = await db.query(
+      `INSERT INTO "group" (name, id_module, year) VALUES ($1, $2, $3) RETURNING id`,
+      [newName, id_module, year]
+    );
+    return { id: created[0].id, created: true };
+  }
+  if (!id_group) return { id: null, created: false };
+  const { rows } = await db.query(`SELECT id, id_module, year FROM "group" WHERE id = $1 LIMIT 1`, [id_group]);
+  if (!rows[0]?.id) throw httpError(404, "El grupo seleccionado no existe.");
+  if (Number(rows[0].id_module) !== Number(id_module)) {
+    throw httpError(400, "El grupo seleccionado no pertenece al módulo elegido.");
+  }
+  if (Number(rows[0].year) !== Number(year)) {
+    throw httpError(403, `El grupo no pertenece al año lectivo vigente (${year}).`);
+  }
+  return { id: rows[0].id, created: false };
+}
+
+async function assertNoDuplicateClass(db, { name, level, id_module, year, excludeId = null }) {
+  const params = [year, level, id_module, name];
+  let sql = `SELECT id FROM class
+             WHERE year = $1 AND level = $2 AND id_module = $3 AND ${SQL_NORM_NAME} = lower($4)`;
+  if (excludeId) { params.push(excludeId); sql += ` AND id <> $${params.length}`; }
+  const { rows } = await db.query(sql + ` LIMIT 1`, params);
+  if (rows[0]?.id) {
+    throw httpError(409, `Ya existe la materia "${name}" en ese nivel y módulo.`);
+  }
+}
+
+// Cuenta la información asociada a una materia.
+async function getClassDependencies(db, id) {
+  const { rows } = await db.query(
+    `SELECT
+       (SELECT count(*) FROM class_teacher     WHERE id_class = $1)::int AS assignments,
+       (SELECT count(*) FROM evaluation        WHERE id_class = $1)::int AS evaluations,
+       (SELECT count(*) FROM grades g JOIN evaluation e ON e.id = g.id_exam
+                                               WHERE e.id_class = $1)::int AS grades,
+       (SELECT count(*) FROM asistencia_sesion WHERE id_class = $1)::int AS attendance_sessions`,
+    [id]
+  );
+  return rows[0];
+}
+
+function classErrorResponse(res, e, fallback) {
+  if (e?.status) return res.status(e.status).json({ error: e.message });
+  if (isUniqueViolation(e)) {
+    return res.status(409).json({ error: "Ya existe un registro con ese nombre (materia, módulo o grupo)." });
+  }
+  return res.status(500).json({ error: e?.message || fallback });
+}
+
+// Body: { name, level, id_module | new_module_name, id_group | new_group_name }
+// Crea la materia y, si se indican, el módulo/grupo nuevos en una sola transacción.
 adminRouter.post("/classes", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const name = cleanStr(req.body?.name);
+    const name = normName(req.body?.name);
     const level = toInt(req.body?.level);
 
-    let id_module = toInt(req.body?.id_module);
-    let id_group = toInt(req.body?.id_group);
-
-    const new_module_name = cleanStr(req.body?.new_module_name);
-    const new_group_name = cleanStr(req.body?.new_group_name);
-
-    if (!name) return res.status(400).json({ error: "name requerido" });
-    if (!level) return res.status(400).json({ error: "level requerido" });
-
-    // módulo existente o nuevo
-    if (!id_module && !new_module_name) {
-      return res.status(400).json({ error: "Debes seleccionar un módulo o crear uno nuevo" });
-    }
+    if (!name) return res.status(400).json({ error: "El nombre de la materia es obligatorio." });
+    if (!level) return res.status(400).json({ error: "Selecciona un nivel." });
 
     const vigente = await getAnioLectivoVigente();
 
-    if (!id_module && new_module_name) {
-      const mod = await getOrCreateModuleByName(new_module_name, vigente);
-      id_module = mod.id;
-    } else if (id_module) {
-      const { rows: modRows } = await query(`SELECT id, name FROM module WHERE id = $1 LIMIT 1`, [id_module]);
-      if (!modRows[0]?.id) return res.status(404).json({ error: "Módulo no existe" });
-    }
+    const result = await withTransaction(async (db) => {
+      const mod = await resolveModuleForClass(db, {
+        id_module: toInt(req.body?.id_module),
+        new_module_name: req.body?.new_module_name,
+      }, vigente);
+      const grp = await resolveGroupForClass(db, {
+        id_group: toInt(req.body?.id_group),
+        new_group_name: req.body?.new_group_name,
+      }, mod.id, vigente);
 
-    // grupo existente o nuevo (opcional)
-    if (!id_group && new_group_name) {
-      const grp = await getOrCreateGroupByName(new_group_name, vigente);
-      id_group = grp.id;
-    } else if (id_group) {
-      const { rows: grpRows } = await query(`SELECT id, name FROM "group" WHERE id = $1 LIMIT 1`, [id_group]);
-      if (!grpRows[0]?.id) return res.status(404).json({ error: "Grupo no existe" });
-    }
+      await assertNoDuplicateClass(db, { name, level, id_module: mod.id, year: vigente });
 
-    const { rows: createdRows } = await query(
-      `INSERT INTO class (name, level, id_module, year, id_group)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, name, level, id_module, id_group, year, created_at`,
-      [name, level, id_module, vigente, id_group || null]
-    );
+      const { rows: createdRows } = await db.query(
+        `INSERT INTO class (name, level, id_module, year, id_group)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, name, level, id_module, id_group, year, created_at`,
+        [name, level, mod.id, vigente, grp.id]
+      );
+      return { item: createdRows[0], module_created: mod.created, group_created: grp.created };
+    });
 
-    return res.json({ item: createdRows[0] });
+    return res.json(result);
   } catch (e) {
-    return res.status(500).json({ error: e?.message || "Error creando materia" });
+    return classErrorResponse(res, e, "Error creando materia");
+  }
+});
+
+// Información asociada a una materia (para confirmar antes de eliminar).
+adminRouter.get("/classes/:id/dependencies", requireAuth, requireAdmin, async (req, res) => {
+  const id = toInt(req.params.id);
+  if (!id) return res.status(400).json({ error: "id inválido" });
+  try {
+    const { rows } = await query(`SELECT id FROM class WHERE id = $1 LIMIT 1`, [id]);
+    if (!rows[0]?.id) return res.status(404).json({ error: "La materia no existe." });
+    return res.json({ item: await getClassDependencies({ query }, id) });
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Error consultando dependencias" });
+  }
+});
+
+// Body: igual que POST. Reglas de integridad:
+//  - Con evaluaciones o asistencia registradas solo se puede cambiar el nombre.
+//  - Con profesores asignados no se puede cambiar el nivel (los cursos son por nivel).
+adminRouter.put("/classes/:id", requireAuth, requireAdmin, async (req, res) => {
+  const id = toInt(req.params.id);
+  if (!id) return res.status(400).json({ error: "id inválido" });
+
+  try { await requireAnioVigenteForRecord("class", id); }
+  catch (err) { return handleYearError(res, err); }
+
+  try {
+    const name = normName(req.body?.name);
+    const level = toInt(req.body?.level);
+
+    if (!name) return res.status(400).json({ error: "El nombre de la materia es obligatorio." });
+    if (!level) return res.status(400).json({ error: "Selecciona un nivel." });
+
+    const vigente = await getAnioLectivoVigente();
+
+    const result = await withTransaction(async (db) => {
+      const { rows: curRows } = await db.query(
+        `SELECT id, level, id_module, id_group FROM class WHERE id = $1 FOR UPDATE`,
+        [id]
+      );
+      const current = curRows[0];
+      if (!current) throw httpError(404, "La materia no existe.");
+
+      const mod = await resolveModuleForClass(db, {
+        id_module: toInt(req.body?.id_module),
+        new_module_name: req.body?.new_module_name,
+      }, vigente);
+      const grp = await resolveGroupForClass(db, {
+        id_group: toInt(req.body?.id_group),
+        new_group_name: req.body?.new_group_name,
+      }, mod.id, vigente);
+
+      const levelChanged = Number(current.level) !== Number(level);
+      const structureChanged =
+        Number(current.id_module) !== Number(mod.id) ||
+        Number(current.id_group ?? 0) !== Number(grp.id ?? 0);
+
+      if (levelChanged || structureChanged) {
+        const deps = await getClassDependencies(db, id);
+        if ((deps.evaluations > 0 || deps.attendance_sessions > 0)) {
+          throw httpError(409,
+            `La materia tiene ${deps.evaluations} evaluación(es) y ${deps.attendance_sessions} sesión(es) de asistencia registradas; ` +
+            `solo se puede modificar su nombre.`);
+        }
+        if (levelChanged && deps.assignments > 0) {
+          throw httpError(409,
+            `La materia tiene ${deps.assignments} asignación(es) de profesor; quítalas antes de cambiar el nivel.`);
+        }
+      }
+
+      await assertNoDuplicateClass(db, { name, level, id_module: mod.id, year: vigente, excludeId: id });
+
+      const { rows: updRows } = await db.query(
+        `UPDATE class SET name = $1, level = $2, id_module = $3, id_group = $4
+         WHERE id = $5
+         RETURNING id, name, level, id_module, id_group, year, created_at`,
+        [name, level, mod.id, grp.id, id]
+      );
+      return { item: updRows[0], module_created: mod.created, group_created: grp.created };
+    });
+
+    return res.json(result);
+  } catch (e) {
+    return classErrorResponse(res, e, "Error actualizando materia");
+  }
+});
+
+// Elimina una materia. Nunca elimina su módulo ni su grupo.
+// Se bloquea si tiene evaluaciones (y por ende notas) o asistencia registradas;
+// las asignaciones de profesor se eliminan junto con la materia (el frontend las
+// informa en la confirmación).
+adminRouter.delete("/classes/:id", requireAuth, requireAdmin, async (req, res) => {
+  const id = toInt(req.params.id);
+  if (!id) return res.status(400).json({ error: "id inválido" });
+
+  try { await requireAnioVigenteForRecord("class", id); }
+  catch (err) { return handleYearError(res, err); }
+
+  try {
+    const result = await withTransaction(async (db) => {
+      const { rows: curRows } = await db.query(`SELECT id FROM class WHERE id = $1 FOR UPDATE`, [id]);
+      if (!curRows[0]) throw httpError(404, "La materia no existe.");
+
+      const deps = await getClassDependencies(db, id);
+      if (deps.evaluations > 0 || deps.attendance_sessions > 0) {
+        throw httpError(409,
+          `No se puede eliminar: la materia tiene ${deps.evaluations} evaluación(es), ` +
+          `${deps.grades} nota(s) y ${deps.attendance_sessions} sesión(es) de asistencia registradas.`);
+      }
+
+      await db.query(`DELETE FROM class_teacher WHERE id_class = $1`, [id]);
+      await db.query(`DELETE FROM class WHERE id = $1`, [id]);
+      return { ok: true, removed_assignments: deps.assignments };
+    });
+    return res.json(result);
+  } catch (e) {
+    return classErrorResponse(res, e, "Error eliminando materia");
   }
 });
 

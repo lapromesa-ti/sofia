@@ -13,6 +13,7 @@ import * as XLSX from "xlsx";
 import ChangePasswordButton from "@/components/ChangePasswordButton";
 import CrearExamen, { type CrearExamenCtx, type ExamInitialData } from "./CrearExamen";
 import HabilitarExamenes from "./HabilitarExamenes";
+import CreatableCombo, { nameKey, normalizeName, type ComboOption, type ComboValue } from "./CreatableCombo";
 
 type Course = { id: number; name: string; level: number; year: string | null; user_count?: number; id_monitor?: string | null; monitor_name?: string | null };
 
@@ -91,8 +92,6 @@ type GradeGridResponse = {
   students: StudentRow[];
   grades: GridGradeRow[];
 };
-
-const OTHER_OPTION = "__OTHER__";
 
 type AdminView =
   | ""
@@ -255,10 +254,13 @@ export default function AdminPage() {
 
   const [newClassName, setNewClassName] = useState("");
   const [newClassLevel, setNewClassLevel] = useState<number>(0);
-  const [newClassModuleId, setNewClassModuleId] = useState<string>("");
-  const [newClassGroupId, setNewClassGroupId] = useState<string>("");
-  const [newModuleName, setNewModuleName] = useState("");
-  const [_newGroupName, setNewGroupName] = useState("");
+  const [classModuleSel, setClassModuleSel] = useState<ComboValue>(null);
+  const [classGroupSel, setClassGroupSel] = useState<ComboValue>(null);
+  const [editingClassId, setEditingClassId] = useState<number | null>(null);
+  const [classSaving, setClassSaving] = useState(false);
+  const [classDeletingId, setClassDeletingId] = useState<number | null>(null);
+  const [tblSearch, setTblSearch] = useState("");
+  const classFormRef = useRef<HTMLDivElement | null>(null);
   const [tblFilterLevel, setTblFilterLevel] = useState<string>("");
   const [tblFilterModule, setTblFilterModule] = useState<string>("");
   const [tblFilterGroup, setTblFilterGroup] = useState<string>("");
@@ -559,26 +561,27 @@ export default function AdminPage() {
     return [...modules].sort((a, b) => a.name.localeCompare(b.name, "es"));
   }, [modules]);
 
-  const _classesByLevelAndModule = useMemo(() => {
-    return classes.filter((c) => {
-      if (Number(c.level) !== Number(newClassLevel)) return false;
-      if (newClassModuleId && newClassModuleId !== OTHER_OPTION && Number(c.id_module) !== Number(newClassModuleId)) return false;
-      return true;
-    });
-  }, [classes, newClassLevel, newClassModuleId]);
+  const editingClass = useMemo(
+    () => (editingClassId ? classes.find((c) => c.id === editingClassId) ?? null : null),
+    [classes, editingClassId]
+  );
 
-  const availableGroupsForCreate = useMemo(() => {
-    if (!newClassModuleId || newClassModuleId === OTHER_OPTION) return [];
+  // Grupos del módulo elegido. id=0 es el centinela "sin grupo": se muestra con el
+  // nombre del módulo cuando éste no tiene grupos (comportamiento previo), cuando el
+  // módulo es nuevo, o cuando la materia en edición no tiene grupo en ese módulo.
+  const availableGroupsForCreate = useMemo<ComboOption[]>(() => {
+    if (!classModuleSel) return [];
+    if (classModuleSel.kind === "new") return [{ id: 0, name: classModuleSel.name }];
     const filtered = groups
-      .filter((g) => Number(g.id_module) === Number(newClassModuleId))
+      .filter((g) => Number(g.id_module) === Number(classModuleSel.id))
       .sort((a, b) => a.name.localeCompare(b.name, "es"));
-    if (filtered.length === 0) {
-      // Module has no groups — use the module itself as the only option (id=0 sentinel)
-      const mod = modules.find((m) => String(m.id) === newClassModuleId);
-      if (mod) return [{ id: 0, name: mod.name }];
-    }
+    const keepNoGroup =
+      editingClass != null &&
+      !editingClass.groups?.length &&
+      Number(editingClass.id_module) === Number(classModuleSel.id);
+    if (filtered.length === 0 || keepNoGroup) return [{ id: 0, name: classModuleSel.name }, ...filtered];
     return filtered;
-  }, [groups, newClassModuleId, modules]);
+  }, [groups, classModuleSel, editingClass]);
 
   // ── Tabla filtros en cascada ──
   const tblLevelOptions = useMemo(() => {
@@ -627,9 +630,14 @@ export default function AdminPage() {
         if (!grpNames.includes(tblFilterGroup)) return false;
       }
       if (tblFilterName && c.name !== tblFilterName) return false;
+      if (tblSearch.trim()) {
+        const q = nameKey(tblSearch);
+        const hay = [c.name, c.module_name ?? "", ...(c.groups ?? []).map((g) => g.name)].map(nameKey);
+        if (!hay.some((h) => h.includes(q))) return false;
+      }
       return true;
     });
-  }, [classes, tblFilterLevel, tblFilterModule, tblFilterGroup, tblFilterName]);
+  }, [classes, tblFilterLevel, tblFilterModule, tblFilterGroup, tblFilterName, tblSearch]);
 
   const coursesForGrid = useMemo(() => {
     let r = courses;
@@ -871,18 +879,6 @@ export default function AdminPage() {
     setSelClass("");
   }, [selAssignLevel]);
 
-  useEffect(() => {
-    setNewClassModuleId("");
-    setNewClassGroupId("");
-    setNewModuleName("");
-    setNewGroupName("");
-  }, [newClassLevel]);
-
-  useEffect(() => {
-    setNewClassGroupId("");
-    setNewGroupName("");
-  }, [newClassModuleId]);
-
   // Tabla materias: reset en cascada
   useEffect(() => { setTblFilterModule(""); setTblFilterGroup(""); setTblFilterName(""); }, [tblFilterLevel]);
   useEffect(() => { setTblFilterGroup(""); setTblFilterName(""); }, [tblFilterModule]);
@@ -1088,46 +1084,126 @@ export default function AdminPage() {
     }
   }
 
-  async function createClass() {
+  function resetClassForm() {
+    setEditingClassId(null);
+    setNewClassName("");
+    setNewClassLevel(0);
+    setClassModuleSel(null);
+    setClassGroupSel(null);
+  }
+
+  function startEditClass(c: ClassItem) {
+    setEditingClassId(c.id);
+    setNewClassLevel(Number(c.level));
+    setClassModuleSel(
+      c.id_module ? { kind: "existing", id: Number(c.id_module), name: c.module_name ?? "" } : null
+    );
+    const g = c.groups?.[0];
+    setClassGroupSel(
+      g
+        ? { kind: "existing", id: Number(g.id), name: g.name }
+        : c.id_module
+          ? { kind: "existing", id: 0, name: c.module_name ?? "" }
+          : null
+    );
+    setNewClassName(c.name);
+    classFormRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function saveClass() {
     if (!newClassLevel) return flash("Selecciona un Nivel.", "err");
+    if (!classModuleSel || !normalizeName(classModuleSel.name)) return flash("Selecciona o escribe un Módulo.", "err");
+    if (!classGroupSel || (classGroupSel.kind === "new" && !normalizeName(classGroupSel.name)))
+      return flash("Selecciona o escribe un Grupo.", "err");
 
-    const isOtherModule = newClassModuleId === OTHER_OPTION;
-    if (!newClassModuleId) return flash("Selecciona un Módulo.", "err");
-    if (isOtherModule && !newModuleName.trim()) return flash("Escribe el nombre del nuevo módulo.", "err");
-    if (!newClassGroupId) return flash("Selecciona un Grupo.", "err");
-
-    const name = newClassName.trim();
+    const name = normalizeName(newClassName);
     if (!name) return flash("Escribe el nombre de la materia.", "err");
 
-    const isModuleAsGroup = newClassGroupId === "0"; // sentinel: module has no groups
-    const id_module = !isOtherModule ? Number(newClassModuleId || "0") : 0;
-    const id_group = !isModuleAsGroup ? Number(newClassGroupId || "0") : 0;
-    const new_module_name = isOtherModule ? newModuleName.trim() : "";
-    const new_group_name = "";
+    // Duplicado (sin distinguir mayúsculas, tildes ni espacios) en el mismo nivel y módulo
+    if (classModuleSel.kind === "existing") {
+      const dup = classes.find(
+        (c) =>
+          c.id !== editingClassId &&
+          Number(c.level) === Number(newClassLevel) &&
+          Number(c.id_module) === Number(classModuleSel.id) &&
+          nameKey(c.name) === nameKey(name)
+      );
+      if (dup) return flash(`Ya existe la materia "${dup.name}" en ese nivel y módulo.`, "err");
+    }
 
+    const body = {
+      name,
+      level: newClassLevel,
+      id_module: classModuleSel.kind === "existing" ? classModuleSel.id : null,
+      new_module_name: classModuleSel.kind === "new" ? normalizeName(classModuleSel.name) : "",
+      // id 0 = centinela "sin grupo"
+      id_group: classGroupSel.kind === "existing" && classGroupSel.id ? classGroupSel.id : null,
+      new_group_name: classGroupSel.kind === "new" ? normalizeName(classGroupSel.name) : "",
+    };
+
+    const isEdit = editingClassId != null;
+    setClassSaving(true);
     try {
-      await apiFetch("/api/admin/classes", {
-        method: "POST",
-        body: JSON.stringify({
-          name,
-          level: newClassLevel,
-          id_module: id_module || null,
-          id_group: id_group || null,
-          new_module_name,
-          new_group_name,
-        }),
+      const res = await apiFetch(isEdit ? `/api/admin/classes/${editingClassId}` : "/api/admin/classes", {
+        method: isEdit ? "PUT" : "POST",
+        body: JSON.stringify(body),
       });
 
-      setNewClassName("");
-      setNewClassModuleId("");
-      setNewClassGroupId("");
-      setNewModuleName("");
-      setNewGroupName("");
+      const extras: string[] = [];
+      if (res?.module_created) extras.push("módulo creado");
+      if (res?.group_created) extras.push("grupo creado");
+      const suffix = extras.length ? ` (${extras.join(", ")})` : "";
 
-      flash("✅ Materia creada", "ok");
+      if (isEdit) {
+        resetClassForm();
+      } else {
+        // Se conservan nivel/módulo/grupo para seguir cargando materias en el mismo lugar;
+        // el módulo/grupo nuevo queda seleccionado como registro existente.
+        setNewClassName("");
+        const item = res?.item;
+        if (item?.id_module) {
+          setClassModuleSel({ kind: "existing", id: Number(item.id_module), name: normalizeName(classModuleSel.name) });
+          setClassGroupSel(
+            item.id_group
+              ? { kind: "existing", id: Number(item.id_group), name: normalizeName(classGroupSel.name) }
+              : { kind: "existing", id: 0, name: normalizeName(classModuleSel.name) }
+          );
+        }
+      }
+      flash(`✅ Materia ${isEdit ? "actualizada" : "creada"}${suffix}`, "ok");
       await loadAll(adminYear);
     } catch (e) {
-      flash((e as { message?: string })?.message || "Error creando materia", "err");
+      flash((e as { message?: string })?.message || `Error ${isEdit ? "actualizando" : "creando"} materia`, "err");
+    } finally {
+      setClassSaving(false);
+    }
+  }
+
+  async function deleteClass(c: ClassItem) {
+    setClassDeletingId(c.id);
+    try {
+      const dep = await apiFetch(`/api/admin/classes/${c.id}/dependencies`);
+      const d = (dep?.item || {}) as { assignments?: number; evaluations?: number; grades?: number; attendance_sessions?: number };
+      if ((d.evaluations ?? 0) > 0 || (d.attendance_sessions ?? 0) > 0) {
+        flash(
+          `No se puede eliminar "${c.name}": tiene ${d.evaluations ?? 0} evaluación(es), ${d.grades ?? 0} nota(s) y ${d.attendance_sessions ?? 0} sesión(es) de asistencia.`,
+          "err"
+        );
+        return;
+      }
+      const extra = (d.assignments ?? 0) > 0
+        ? `\n\nTambién se quitarán ${d.assignments} asignación(es) de profesor a esta materia.`
+        : "";
+      if (!confirm(`¿Eliminar la materia "${c.name}"?\nEl módulo y el grupo no se eliminan.${extra}`)) return;
+
+      await apiFetch(`/api/admin/classes/${c.id}`, { method: "DELETE" });
+      if (editingClassId === c.id) resetClassForm();
+      flash("✅ Materia eliminada", "ok");
+      await loadAll(adminYear);
+    } catch (e) {
+      flash((e as { message?: string })?.message || "Error eliminando materia", "err");
+    } finally {
+      setClassDeletingId(null);
     }
   }
 
@@ -1254,12 +1330,8 @@ export default function AdminPage() {
         setMonitorSelectedId("");
         break;
       case "CLASSES":
-        setNewClassName("");
-        setNewClassLevel(0);
-        setNewClassModuleId("");
-        setNewClassGroupId("");
-        setNewModuleName("");
-        setNewGroupName("");
+        resetClassForm();
+        setTblSearch("");
         setTblFilterLevel("");
         setTblFilterModule("");
         setTblFilterGroup("");
@@ -2711,17 +2783,30 @@ export default function AdminPage() {
           )}
 
           {view === "CLASSES" && (
-            <div className="card" style={{ marginTop: 18 }}>
-              <h2 style={{ marginTop: 0 }}>Crear una Materia</h2>
+            <div className="card" style={{ marginTop: 18 }} ref={classFormRef}>
+              <h2 style={{ marginTop: 0 }}>
+                {editingClass ? `Editar Materia: ${editingClass.name}` : "Crear una Materia"}
+              </h2>
+
+              {/* Colapsa el formulario a una columna en pantallas pequeñas */}
+              <style>{`
+                @media (max-width: 768px) {
+                  .materiaFormGrid { grid-template-columns: 1fr !important; }
+                  .materiaTableWrap { overflow-x: auto !important; }
+                }
+              `}</style>
 
               {/* ── Fila principal: Nivel | Módulo | Grupo | Nombre | Guardar | Cancelar ── */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr auto auto", gap: 12, alignItems: "flex-end" }}>
+              <div className="materiaFormGrid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr auto auto", gap: 12, alignItems: "flex-start" }}>
                 <div>
                   <div className="label">Nivel</div>
                   <select
                     className="select"
                     value={newClassLevel}
-                    onChange={(e) => setNewClassLevel(Number(e.target.value))}
+                    onChange={(e) => {
+                      setNewClassLevel(Number(e.target.value));
+                      if (!editingClass) { setClassModuleSel(null); setClassGroupSel(null); }
+                    }}
                   >
                     <option value={0} disabled>Selecciona...</option>
                     {levels.map((x) => (
@@ -2732,33 +2817,26 @@ export default function AdminPage() {
 
                 <div>
                   <div className="label">Módulo</div>
-                  <select
-                    className="select"
-                    value={newClassModuleId}
-                    onChange={(e) => setNewClassModuleId(e.target.value)}
-                    disabled={!newClassLevel}
-                  >
-                    <option value="">{!newClassLevel ? "Selecciona un nivel primero" : "Selecciona..."}</option>
-                    {availableModulesForCreate.map((m) => (
-                      <option key={m.id} value={String(m.id)}>{m.name}</option>
-                    ))}
-                    <option value={OTHER_OPTION}>Otro...</option>
-                  </select>
+                  <CreatableCombo
+                    entity="módulo"
+                    value={classModuleSel}
+                    options={availableModulesForCreate}
+                    onChange={(v) => { setClassModuleSel(v); setClassGroupSel(null); }}
+                    placeholder={!newClassLevel ? "Selecciona un nivel primero" : "Escribe o selecciona..."}
+                    disabled={!newClassLevel || isHistoricalYear}
+                  />
                 </div>
 
                 <div>
                   <div className="label">Grupo</div>
-                  <select
-                    className="select"
-                    value={newClassGroupId}
-                    onChange={(e) => setNewClassGroupId(e.target.value)}
-                    disabled={!newClassModuleId}
-                  >
-                    <option value="">{!newClassModuleId ? "Selecciona un módulo primero" : "Selecciona..."}</option>
-                    {availableGroupsForCreate.map((g) => (
-                      <option key={g.id} value={String(g.id)}>{g.name}</option>
-                    ))}
-                  </select>
+                  <CreatableCombo
+                    entity="grupo"
+                    value={classGroupSel}
+                    options={availableGroupsForCreate}
+                    onChange={setClassGroupSel}
+                    placeholder={!classModuleSel ? "Selecciona un módulo primero" : "Escribe o selecciona..."}
+                    disabled={!classModuleSel || isHistoricalYear}
+                  />
                 </div>
 
                 <div>
@@ -2767,59 +2845,60 @@ export default function AdminPage() {
                     className="input"
                     value={newClassName}
                     onChange={(e) => setNewClassName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter" && !classSaving) saveClass(); }}
                     placeholder="Ej: La Oración"
-                    disabled={!newClassGroupId}
+                    disabled={!classGroupSel || isHistoricalYear}
                   />
                 </div>
 
-                <button
-                  className="btn"
-                  onClick={createClass}
-                  disabled={isHistoricalYear}
-                  title={isHistoricalYear ? `Solo se puede modificar el año vigente (${adminYearActivo})` : undefined}
-                  style={{ padding: "10px 16px", whiteSpace: "nowrap" }}
-                >
-                  Guardar
-                </button>
-                <button
-                  type="button"
-                  className="btn"
-                  style={{ padding: "10px 16px", whiteSpace: "nowrap", background: "#4b5563", borderColor: "#4b5563" }}
-                  onClick={() => {
-                    setNewClassLevel(0);
-                    setNewClassModuleId("");
-                    setNewClassGroupId("");
-                    setNewClassName("");
-                    setNewModuleName("");
-                    setNewGroupName("");
-                    setTblFilterLevel("");
-                    setTblFilterModule("");
-                    setTblFilterGroup("");
-                    setTblFilterName("");
-                    setMsg(null);
-                    setOkMsg(null);
-                    loadAll(adminYear);
-                  }}
-                >
-                  Cancelar
-                </button>
+                <div>
+                  <div className="label">&nbsp;</div>
+                  <button
+                    className="btn"
+                    onClick={saveClass}
+                    disabled={isHistoricalYear || classSaving}
+                    title={isHistoricalYear ? `Solo se puede modificar el año vigente (${adminYearActivo})` : undefined}
+                    style={{ padding: "10px 16px", whiteSpace: "nowrap", width: "100%" }}
+                  >
+                    {classSaving ? "Guardando..." : editingClass ? "Guardar cambios" : "Guardar"}
+                  </button>
+                </div>
+                <div>
+                  <div className="label">&nbsp;</div>
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ padding: "10px 16px", whiteSpace: "nowrap", width: "100%", background: "#4b5563", borderColor: "#4b5563" }}
+                    onClick={() => {
+                      resetClassForm();
+                      setTblSearch("");
+                      setTblFilterLevel("");
+                      setTblFilterModule("");
+                      setTblFilterGroup("");
+                      setTblFilterName("");
+                      setMsg(null);
+                      setOkMsg(null);
+                      loadAll(adminYear);
+                    }}
+                  >
+                    {editingClass ? "Cancelar edición" : "Cancelar"}
+                  </button>
+                </div>
               </div>
 
-              {/* Input extra para nuevo módulo */}
-              {newClassModuleId === OTHER_OPTION && (
-                <div style={{ marginTop: 10 }}>
-                  <div className="label">Nombre del nuevo módulo</div>
-                  <input
-                    className="input"
-                    value={newModuleName}
-                    onChange={(e) => setNewModuleName(e.target.value)}
-                    placeholder="Nombre del nuevo módulo"
-                  />
-                </div>
-              )}
+              {/* ── Buscador de materias ── */}
+              <div style={{ marginTop: 16, maxWidth: 420 }}>
+                <input
+                  className="input"
+                  value={tblSearch}
+                  onChange={(e) => setTblSearch(e.target.value)}
+                  placeholder="Buscar materia, módulo o grupo..."
+                />
+              </div>
 
               {/* ── Tabla de materias existentes ── */}
               <div
+                className="materiaTableWrap"
                 style={{
                   marginTop: 16,
                   overflow: "hidden",
@@ -2856,22 +2935,53 @@ export default function AdminPage() {
                           </select>
                         </th>
                       ))}
+                      <th style={{ padding: "8px 12px", textAlign: "right", fontSize: 13, fontWeight: 600, color: "var(--muted)" }}>Acciones</th>
                     </tr>
                   </thead>
                   <tbody>
                     {classesFiltered.length === 0 ? (
                       <tr>
-                        <td colSpan={4} style={{ padding: 12, color: "var(--muted)" }}>
+                        <td colSpan={5} style={{ padding: 12, color: "var(--muted)" }}>
                           {loadingData ? "Cargando..." : "Sin materias"}
                         </td>
                       </tr>
                     ) : (
                       classesFiltered.map((c, idx) => (
-                        <tr key={c.id} style={{ borderTop: "1px solid rgba(2,132,199,.10)", background: getGrillaBaseRowBg(idx, isDarkThemeEnabled()) }}>
+                        <tr
+                          key={c.id}
+                          style={{
+                            borderTop: "1px solid rgba(2,132,199,.10)",
+                            background: editingClassId === c.id
+                              ? getGrillaActiveRowBg(isDarkThemeEnabled())
+                              : getGrillaBaseRowBg(idx, isDarkThemeEnabled()),
+                          }}
+                        >
                           <td style={{ padding: 12 }}>{levels.find((l) => l.id === Number(c.level))?.name ?? c.level}</td>
                           <td style={{ padding: 12 }}>{c.module_name || "—"}</td>
                           <td style={{ padding: 12 }}>{c.groups?.length ? c.groups.map((g) => g.name).join(", ") : "—"}</td>
                           <td style={{ padding: 12, fontWeight: 500 }}>{c.name}</td>
+                          <td style={{ padding: "8px 12px", textAlign: "right", whiteSpace: "nowrap" }}>
+                            <button
+                              type="button"
+                              className="btn"
+                              style={{ padding: "4px 14px", fontSize: 12, height: 30, borderRadius: 8, marginRight: 6, background: "linear-gradient(180deg, #1e40af 0%, #1e3a8a 100%)", borderColor: "#1e3a8a" }}
+                              onClick={() => startEditClass(c)}
+                              disabled={isHistoricalYear}
+                              title={isHistoricalYear ? `Solo se puede modificar el año vigente (${adminYearActivo})` : "Editar materia"}
+                            >
+                              Editar
+                            </button>
+                            <button
+                              type="button"
+                              className="btn"
+                              style={{ padding: "4px 14px", fontSize: 12, height: 30, borderRadius: 8, background: "#b91c1c", borderColor: "#b91c1c" }}
+                              onClick={() => deleteClass(c)}
+                              disabled={isHistoricalYear || classDeletingId === c.id}
+                              title={isHistoricalYear ? `Solo se puede modificar el año vigente (${adminYearActivo})` : "Eliminar materia"}
+                            >
+                              {classDeletingId === c.id ? "..." : "Eliminar"}
+                            </button>
+                          </td>
                         </tr>
                       ))
                     )}
